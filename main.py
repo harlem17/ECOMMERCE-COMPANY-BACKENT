@@ -1,394 +1,271 @@
-from fastapi import FastAPI, HTTPException
-from tortoise.contrib.fastapi import register_tortoise
-from models import Product, Payment, Customer, Order
+from fastapi import FastAPI, HTTPException, Depends, Security
 from pydantic import BaseModel
-from fastapi.responses import JSONResponse
-from typing import List
-from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from pydantic import BaseModel
-from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
-from passlib.hash import bcrypt
+from typing import List
 
 app = FastAPI()
 
-# Definición de los modelos
-class ProductIn(BaseModel):
-    title: str
-    price: float
+class Product(BaseModel):
+    id: int
+    name: str
     description: str
-    category: str
-    image: str
+    price: float
+    quantity: int
 
-class PaymentIn(BaseModel):
-    card_number: str
-    cardholder_name: str
-    expiration_date: str
-    cvv: str
+# Simulación de base de datos de usuarios
+class User(BaseModel):
+    id: int
+    username: str
+    password: str
+    email: str
 
-class CustomerIn(BaseModel):
+class Customer(BaseModel):
+    id: int
     name: str
     email: str
-    phone: str
+    address: str
 
-class OrderUpdate(BaseModel):
+customers_db = []
+
+class CreditCard(BaseModel):
+    card_number: str  # Número de tarjeta de crédito
+    expiration_date: str  # Fecha de caducidad en formato MM/YY
+    cvv: str  # Código de seguridad de la tarjeta
+
+class Payment(BaseModel):
+    id: int
+    credit_card: CreditCard
+    order_id: int # Cantidad de productos a comprar
+
+payments_db = []
+
+# Ejemplo de base de datos de inventario
+inventory_db = {
+    1: {"name": "Sweater", "stock": 14, "price": 50.0},
+    # Otros productos aquí...
+}
+
+class OrderItem(BaseModel):
+    product_id: int
+    quantity: int
+
+class Order(BaseModel):
+    id: int
     customer_id: int
-    payment_id: int
-    product_ids: List[int]
+    items: List[OrderItem]
 
-# Configuración de seguridad
-SECRET_KEY = "TuSuperClaveSecreta"
+orders_db = []
+
+# Simulación de base de datos de usuarios en memoria
+users = [
+    User(id=1, username="user1", password="password1", email="user1@example.com")
+]
+
+products_db = []
+
+# Configuración de autenticación
+SECRET_KEY = "mi_secreto_secreto"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
-# Simulación de una base de datos de usuarios
-fake_users_db = {
-    "user1": {
-        "username": "user1",
-        "hashed_password": bcrypt.hash("password1")  # Aquí debería ir el hash de la contraseña "password1"
-    }
-}
-
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-# Clase para manejar la autenticación
+# Clase para autenticación y autorización
 class AuthHandler:
-    def __init__(self, secret_key: str, algorithm: str, access_token_expire_minutes: int):
-        self.secret_key = secret_key
-        self.algorithm = algorithm
-        self.access_token_expire_minutes = access_token_expire_minutes
-        self.pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+    def authenticate_user(self, username: str, password: str):
+        user = next((x for x in users if x.username == username), None)
+        if not user or user.password != password:
+            return False
+        return user
 
-    def verify_password(self, plain_password: str, hashed_password: str) -> bool:
-        return self.pwd_context.verify(plain_password, hashed_password)
-
-    def get_password_hash(self, password: str) -> str:
-        return self.pwd_context.hash(password)
-
-    def create_access_token(self, data: dict) -> str:
+    def create_access_token(self, data: dict, expires_delta: timedelta = None):
         to_encode = data.copy()
-        expire = datetime.utcnow() + timedelta(minutes=self.access_token_expire_minutes)
+        if expires_delta:
+            expire = datetime.utcnow() + expires_delta
+        else:
+            expire = datetime.utcnow() + timedelta(minutes=15)
         to_encode.update({"exp": expire})
-        encoded_jwt = jwt.encode(to_encode, self.secret_key, algorithm=self.algorithm)
+        encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
         return encoded_jwt
 
-    def decode_token(self, token: str) -> dict:
-        try:
-            payload = jwt.decode(token, self.secret_key, algorithms=[self.algorithm])
-            return payload
-        except JWTError:
-            return None
+auth_handler = AuthHandler()
 
-auth_handler = AuthHandler(SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES)
-
-def verify_token(token: str) -> bool:
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        return True
-    except JWTError:
-        return False
-
-# Ruta para autenticar usuarios y obtener un token de acceso
+# Ruta para la autenticación y generación de token JWT
 @app.post("/token")
 async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
-    user = fake_users_db.get(form_data.username)
-    if not user or not auth_handler.verify_password(form_data.password, user["hashed_password"]):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid username or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    access_token = auth_handler.create_access_token(data={"sub": user["username"]})
+    user = auth_handler.authenticate_user(form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(status_code=401, detail="Credenciales inválidas")
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = auth_handler.create_access_token(
+        data={"sub": user.username}, expires_delta=access_token_expires
+    )
     return {"access_token": access_token, "token_type": "bearer"}
 
-# Ruta protegida que requiere un token de acceso
-@app.get("/users/me")
-async def read_users_me(token: str = Depends(oauth2_scheme)):
-    payload = auth_handler.decode_token(token)
-    if payload is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-    username = payload.get("sub")
-    if username is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-    return {"username": username}
+# Ruta protegida que requiere autenticación
+@app.get("/items/")
+async def read_items(token: str = Security(oauth2_scheme)):
+    return {"token": token}
 
-# Registro de tortoise
-register_tortoise(
-    app,
-    db_url="postgres://postgres:ozfxkfOxRgkmOnNUkrnpPLrSakQOQsbg@monorail.proxy.rlwy.net:49881/railway",
-    modules={"models": ["models"]},
-    generate_schemas=True
-)
 
+auth_handler = AuthHandler()
+
+# Ruta para la creación de un nuevo producto en el inventario
 @app.post("/products/")
-async def create_product(product: ProductIn, token: str = Depends(oauth2_scheme)):
-    # Verificar el token de acceso
-    if not verify_token(token):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+async def create_product(product: Product, token: str = Security(oauth2_scheme)):
+    # Aquí deberías implementar la lógica para crear un nuevo producto en tu base de datos
+    # Por ahora, solo estamos simulando la creación del producto
+    products_db.append(product)
+    return {"message": "Product created successfully"}
 
-    product_obj = await Product.create(**product.dict())
-    return product_obj
+# Ruta para obtener todos los productos del inventario
+@app.get("/products/")
+async def get_all_products(token: str = Security(oauth2_scheme)):
+    # Aquí deberías implementar la lógica para obtener todos los productos de tu base de datos
+    # Por ahora, solo estamos simulando la obtención de los productos
+    return products_db
 
-@app.get("/products/", response_model=List[dict])
-async def get_all_products(token: str = Depends(oauth2_scheme)):
-    # Verificar el token de acceso
-    if not verify_token(token):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-
-    products = await Product.all().values()
-    return products
-
-@app.put("/products/{product_id}")
-async def update_product(product_id: int, product: ProductIn, token: str = Depends(oauth2_scheme)):
-    # Verificar el token de acceso
-    if not verify_token(token):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-
-    # Verificar si el producto existe
-    existing_product = await Product.get_or_none(id=product_id)
-    if existing_product is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
-
-    # Actualizar el producto con los nuevos datos
-    await existing_product.update_from_dict(product.dict()).save()
-
-    # Devolver el producto actualizado
-    return existing_product
-
-@app.delete("/products/{product_id}")
-async def delete_product(product_id: int, token: str = Depends(oauth2_scheme)):
-    # Verificar el token de acceso
-    if not verify_token(token):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-
-    # Intenta obtener el producto
-    product = await Product.get_or_none(id=product_id)
-
-    # Si el producto no existe, devuelve un error 404
+# Ruta para obtener un producto específico por su ID
+@app.get("/products/{product_id}")
+async def get_product(product_id: int, token: str = Security(oauth2_scheme)):
+    # Aquí deberías implementar la lógica para obtener un producto específico de tu base de datos por su ID
+    # Por ahora, solo estamos simulando la obtención del producto
+    product = next((product for product in products_db if product.id == product_id), None)
     if product is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+        raise HTTPException(status_code=404, detail="Product not found")
+    return product
 
-    # Si el producto existe, elimínalo de la base de datos
-    await product.delete()
+# Ruta para actualizar un producto existente por su ID
+@app.put("/products/{product_id}")
+async def update_product(product_id: int, product: Product, token: str = Security(oauth2_scheme)):
+    # Aquí deberías implementar la lógica para actualizar un producto existente en tu base de datos por su ID
+    # Por ahora, solo estamos simulando la actualización del producto
+    existing_product = next((p for p in products_db if p.id == product_id), None)
+    if existing_product is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+    existing_product.name = product.name
+    existing_product.description = product.description
+    existing_product.price = product.price
+    existing_product.quantity = product.quantity
+    return {"message": "Product updated successfully"}
 
+# Ruta para eliminar un producto existente por su ID
+@app.delete("/products/{product_id}")
+async def delete_product(product_id: int, token: str = Security(oauth2_scheme)):
+    # Aquí deberías implementar la lógica para eliminar un producto existente en tu base de datos por su ID
+    # Por ahora, solo estamos simulando la eliminación del producto
+    global products_db
+    products_db = [p for p in products_db if p.id != product_id]
     return {"message": "Product deleted successfully"}
 
-# Ruta para obtener todos los pagos
-@app.get("/payments/", response_model=List[dict])
-async def get_all_payments(token: str = Depends(oauth2_scheme)):
-    # Verificar el token de acceso
-    if not verify_token(token):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+@app.post("/customers/")
+async def create_customer(customer: Customer, token: str = Security(oauth2_scheme)):
+    customers_db.append(customer)
+    return {"message": "Customer created successfully"}
 
-    # Si el token es válido, obtener todos los pagos
-    payments = await Payment.all().values()
-    return payments
+@app.get("/customers/")
+async def get_all_customers(token: str = Security(oauth2_scheme)):
+    return customers_db
 
-# Ruta para procesar un pago
-@app.post("/payments/")
-async def process_payment(payment: PaymentIn, customer: CustomerIn, product_id: int, token: str = Depends(oauth2_scheme)):
-    # Verificar el token de acceso
-    if not verify_token(token):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-
-    try:
-        # Crear el cliente
-        new_customer = await Customer.create(**customer.dict())
-
-        # Crear el pago
-        payment_obj = await Payment.create(**payment.dict())
-
-        # Crear la orden
-        product = await Product.get_or_none(id=product_id)
-        if product is None:
-            raise HTTPException(status_code=404, detail="Product not found")
-
-        order = await Order.create(customer=new_customer, payment=payment_obj)
-        await order.products.add(product)
-
-        return JSONResponse(content={"message": "Payment processed successfully", "order_id": order.id})
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="An error occurred while processing the payment")
-
-# Ruta para actualizar un pago por su ID
-@app.put("/payments/{payment_id}/")
-async def update_payment(payment_id: int, payment_update: PaymentIn, token: str = Depends(oauth2_scheme)):
-    # Verificar el token de acceso
-    if not verify_token(token):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-
-    # Intenta obtener el pago existente
-    existing_payment = await Payment.get_or_none(id=payment_id)
-    
-    # Si el pago no existe, devuelve un error 404
-    if existing_payment is None:
-        raise HTTPException(status_code=404, detail="Payment not found")
-    
-    # Si el pago existe, actualízalo con los datos proporcionados
-    await existing_payment.update_from_dict(payment_update.dict()).save()
-    
-    return existing_payment
-
-# Ruta para eliminar un pago por su ID
-@app.delete("/payments/{payment_id}")
-async def delete_payment(payment_id: int, token: str = Depends(oauth2_scheme)):
-    # Verificar el token de acceso
-    if not verify_token(token):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-
-    # Intenta obtener el pago
-    payment = await Payment.get_or_none(id=payment_id)
-    
-    # Si el pago no existe, devuelve un error 404
-    if payment is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payment not found")
-    
-    # Si el pago existe, elimínalo de la base de datos
-    await payment.delete()
-    
-    return {"message": "Payment deleted successfully"}
-
-# Ruta para obtener todos los clientes
-@app.get("/customers/", response_model=List[dict])
-async def get_all_customers(token: str = Depends(oauth2_scheme)):
-    # Verificar el token de acceso
-    if not verify_token(token):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-
-    # Si el token es válido, obtener todos los clientes
-    customers = await Customer.all().values()
-    return customers
-
-# Ruta para crear un nuevo cliente
-@app.post("/customers/", response_model=dict)  
-async def create_customer(customer: CustomerIn, token: str = Depends(oauth2_scheme)):
-    # Verificar el token de acceso
-    if not verify_token(token):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-
-    # Crear el cliente con los datos proporcionados
-    customer_obj = await Customer.create(**customer.dict())
-    return customer_obj.dict()
-
-# Ruta para actualizar un cliente por su ID
-@app.put("/customers/{customer_id}")
-async def update_customer(customer_id: int, customer: CustomerIn, token: str = Depends(oauth2_scheme)):
-    # Verificar el token de acceso
-    if not verify_token(token):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-
-    # Intenta obtener el cliente existente
-    existing_customer = await Customer.get_or_none(id=customer_id)
-    if existing_customer is None:
-        raise HTTPException(status_code=404, detail="Customer not found")
-    
-    # Actualizar los datos del cliente con los nuevos datos
-    await existing_customer.update_from_dict(customer.dict()).save()
-    
-    # Devolver el cliente actualizado
-    return existing_customer
-
-# Ruta para eliminar un cliente por su ID
-@app.delete("/customers/{customer_id}/")
-async def delete_customer(customer_id: int, token: str = Depends(oauth2_scheme)):
-    # Verificar el token de acceso
-    if not verify_token(token):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-
-    # Intenta obtener el cliente
-    customer = await Customer.get_or_none(id=customer_id)
+@app.get("/customers/{customer_id}")
+async def get_customer(customer_id: int, token: str = Security(oauth2_scheme)):
+    customer = next((customer for customer in customers_db if customer.id == customer_id), None)
     if customer is None:
         raise HTTPException(status_code=404, detail="Customer not found")
-    
-    # Si el cliente existe, elimínalo de la base de datos
-    await customer.delete()
-    
+    return customer
+
+@app.put("/customers/{customer_id}")
+async def update_customer(customer_id: int, customer: Customer, token: str = Security(oauth2_scheme)):
+    existing_customer = next((c for c in customers_db if c.id == customer_id), None)
+    if existing_customer is None:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    existing_customer.name = customer.name
+    existing_customer.email = customer.email
+    existing_customer.address = customer.address
+    return {"message": "Customer updated successfully"}
+
+@app.delete("/customers/{customer_id}")
+async def delete_customer(customer_id: int, token: str = Security(oauth2_scheme)):
+    global customers_db
+    customers_db = [c for c in customers_db if c.id != customer_id]
     return {"message": "Customer deleted successfully"}
 
-# Ruta para obtener todas las órdenes
-@app.get("/orders/", response_model=List[dict])
-async def get_all_orders(token: str = Depends(oauth2_scheme)):
-    # Verificar el token de acceso
-    if not verify_token(token):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+@app.post("/payments/")
+async def create_payment(payment: Payment, token: str = Security(oauth2_scheme)):
+    # Verificar si la orden asociada existe
+    order_exists = any(order.id == payment.order_id for order in orders_db)
+    if not order_exists:
+        raise HTTPException(status_code=404, detail=f"Order with id {payment.order_id} not found")
+    
+    # Crear el pago
+    payments_db.append(payment)
+    return {"message": "Payment created successfully"}
 
-    # Si el token es válido, obtener todas las órdenes
-    orders = await Order.all().values()
-    return orders
+@app.get("/payments/")
+async def get_all_payments(token: str = Security(oauth2_scheme)):
+    return payments_db
 
-# Ruta para crear una nueva orden
-@app.post("/orders/", response_model=dict)
-async def create_order(payment: PaymentIn, customer: CustomerIn, product_id: int, token: str = Depends(oauth2_scheme)):
-    # Verificar el token de acceso
-    if not verify_token(token):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+@app.get("/payments/{payment_id}")
+async def get_payment(payment_id: int, token: str = Security(oauth2_scheme)):
+    payment = next((payment for payment in payments_db if payment.id == payment_id), None)
+    if payment is None:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    return payment
 
-    try:
-        # Crear el cliente si no existe
-        customer_obj = await Customer.get_or_create(**customer.dict())
+@app.put("/payments/{payment_id}")
+async def update_payment(payment_id: int, payment: Payment, token: str = Security(oauth2_scheme)):
+    existing_payment = next((p for p in payments_db if p.id == payment_id), None)
+    if existing_payment is None:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    existing_payment.credit_card = payment.credit_card
+    existing_payment.order_id = payment.order_id
+    return {"message": "Payment updated successfully"}
 
-        # Crear el pago
-        payment_obj = await Payment.create(**payment.dict())
+@app.delete("/payments/{payment_id}")
+async def delete_payment(payment_id: int, token: str = Security(oauth2_scheme)):
+    global payments_db
+    payments_db = [p for p in payments_db if p.id != payment_id]
+    return {"message": "Payment deleted successfully"}
 
-        # Obtener el producto
-        product = await Product.get_or_none(id=product_id)
+
+@app.post("/orders/")
+async def create_order(order: Order, token: str = Security(oauth2_scheme)):
+    # Verificar si hay suficiente stock para los productos en la orden
+    for item in order.items:
+        product = inventory_db.get(item.product_id)
         if product is None:
-            raise HTTPException(status_code=404, detail="Product not found")
+            raise HTTPException(status_code=404, detail=f"Product with id {item.product_id} not found")
+        if product["stock"] < item.quantity:
+            raise HTTPException(status_code=400, detail=f"Insufficient stock for product with id {item.product_id}")
 
-        # Crear la orden y agregar el producto
-        order = await Order.create(customer=customer_obj, payment=payment_obj)
-        await order.products.add(product)
+    # Crear la orden
+    orders_db.append(order)
+    return {"message": "Order created successfully"}
 
-        return {"message": "Order created successfully", "order_id": order.id}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="An error occurred while creating the order")
+@app.get("/orders/")
+async def get_all_orders(token: str = Security(oauth2_scheme)):
+    return orders_db
 
-# Ruta para actualizar una orden por su ID
-@app.put("/orders/{order_id}")
-async def update_order(order_id: int, order_update: OrderUpdate, token: str = Depends(oauth2_scheme)):
-    # Verificar el token de acceso
-    if not verify_token(token):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-
-    # Verificar si la orden existe
-    existing_order = await Order.get_or_none(id=order_id)
-    if existing_order is None:
-        raise HTTPException(status_code=404, detail="Order not found")
-
-    # Actualizar los datos de la orden con los nuevos datos proporcionados
-    if order_update.customer_id is not None:
-        existing_order.customer_id = order_update.customer_id
-    if order_update.payment_id is not None:
-        existing_order.payment_id = order_update.payment_id
-    if order_update.product_ids is not None:
-        existing_order.products.clear()
-        for product_id in order_update.product_ids:
-            product = await Product.get_or_none(id=product_id)
-            if product:
-                existing_order.products.add(product)
-
-    # Guardar los cambios
-    await existing_order.save()
-
-    # Devolver la orden actualizada
-    return existing_order
-
-# Ruta para eliminar una orden por su ID
-@app.delete("/orders/{order_id}/")
-async def delete_order(order_id: int, token: str = Depends(oauth2_scheme)):
-    # Verificar el token de acceso
-    if not verify_token(token):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-
-    # Intenta obtener la orden
-    order = await Order.get_or_none(id=order_id)
+@app.get("/orders/{order_id}")
+async def get_order(order_id: int, token: str = Security(oauth2_scheme)):
+    order = next((order for order in orders_db if order.id == order_id), None)
     if order is None:
         raise HTTPException(status_code=404, detail="Order not found")
+    return order
 
-    # Si la orden existe, elimínala de la base de datos
-    await order.delete()
+@app.put("/orders/{order_id}")
+async def update_order(order_id: int, order: Order, token: str = Security(oauth2_scheme)):
+    existing_order = next((o for o in orders_db if o.id == order_id), None)
+    if existing_order is None:
+        raise HTTPException(status_code=404, detail="Order not found")
+    existing_order.customer_id = order.customer_id
+    existing_order.items = order.items
+    return {"message": "Order updated successfully"}
 
+@app.delete("/orders/{order_id}")
+async def delete_order(order_id: int, token: str = Security(oauth2_scheme)):
+    global orders_db
+    orders_db = [o for o in orders_db if o.id != order_id]
     return {"message": "Order deleted successfully"}
-
